@@ -1,0 +1,61 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      POSTGRES_DB: ragdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://raguser:ragpass@db:5432/ragdb
+      TRANSFORMERS_OFFLINE: "0"
+      SENTENCE_TRANSFORMERS_HOME: "/app/.cache/sentence_transformers"
+      HF_HOME: "/app/.cache/huggingface"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount app code for hot-reload development
+      - ./app:/app/app:cached
+      - ./tests:/app/tests:cached
+      - hf_cache:/root/.cache/huggingface
+    # Rebuild on compose restart only; code changes hot-reload via --reload flag
+    command: uv run uvicorn app.api.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir=/app/app
+
+  adminer:
+    image: adminer:4
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  hf_cache:

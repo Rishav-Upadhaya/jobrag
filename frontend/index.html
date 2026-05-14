@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JobSearch AI</title>
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1 class="logo">⚡ JobSearch AI</h1>
+        <p class="subtitle">Powered by RAG + LangGraph</p>
+      </div>
+      <div class="history-list" id="history-list"></div>
+      <div class="sidebar-footer">1,000 jobs · 145 companies · 7 categories</div>
+    </aside>
+
+    <main class="main">
+      <section class="chat-container" id="chat-container">
+        <div class="welcome-screen" id="welcome-screen">
+          <h2>Find your next role</h2>
+          <p>Ask anything about 1,000+ job listings across 145 companies</p>
+          <div class="welcome-suggestions">
+            <button class="suggestion-chip" type="button">Senior ML engineer in NYC</button>
+            <button class="suggestion-chip" type="button">Remote internships in product</button>
+            <button class="suggestion-chip" type="button">Backend roles at fintech companies</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="input-area">
+        <div class="input-shell">
+          <textarea id="query-input" rows="1" placeholder="Ask about any job role, company, or skill..."></textarea>
+          <button id="send-btn" type="button" aria-label="Send query">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <path d="M4 12L20 4L14 20L11 13L4 12Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </div>
+        <div class="suggestions">
+          <button class="suggestion-chip" type="button">Senior ML engineer in NYC</button>
+          <button class="suggestion-chip" type="button">Remote internships in product</button>
+          <button class="suggestion-chip" type="button">Backend roles at fintech companies</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="js/app.js" defer></script>
+  </body>
+</html>
