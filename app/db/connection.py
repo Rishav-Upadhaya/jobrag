@@ -45,25 +45,6 @@ def initialize_schema() -> None:
 			migration_sql = migration_file.read()
 		with conn.cursor() as cursor:
 			cursor.execute(migration_sql)
-			cursor.execute(
-				"""
-				SELECT format_type(a.atttypid, a.atttypmod)
-				FROM pg_attribute AS a
-				JOIN pg_class AS c ON c.oid = a.attrelid
-				JOIN pg_namespace AS n ON n.oid = c.relnamespace
-				WHERE n.nspname = 'public'
-				  AND c.relname = 'job_chunks'
-				  AND a.attname = 'embedding'
-				  AND a.attnum > 0
-				  AND NOT a.attisdropped
-				"""
-			)
-			current_type = cursor.fetchone()
-			expected_type = f"vector({settings.EMBEDDING_DIMENSION})"
-			if current_type and current_type[0] != expected_type:
-				cursor.execute(
-					f"ALTER TABLE job_chunks ALTER COLUMN embedding TYPE VECTOR({settings.EMBEDDING_DIMENSION}) USING embedding::vector({settings.EMBEDDING_DIMENSION});"
-				)
 		conn.commit()
 	finally:
 		_ensure_pool().putconn(conn)

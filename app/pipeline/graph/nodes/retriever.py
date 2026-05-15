@@ -1,6 +1,19 @@
 """Retriever node.
 
-Performs hybrid search combining vector and keyword search to retrieve relevant job chunks.
+Performs hybrid search combining LlamaCloud vector search and pgvector FTS
+to retrieve relevant job chunks.
+
+Architecture:
+  reasoning_agent extracts filters (7 fields) + retriever_query
+       ↓
+  hybrid_search:
+    1. SQL pre-filter → job_id whitelist
+    2. LlamaCloud semantic search (restricted to whitelist)
+    3. pgvector FTS keyword search (with SQL filters)
+    4. RRF fusion → Jina rerank → top-k
+
+No embedding happens in this node — LlamaCloud handles all embeddings at
+query time internally.
 
 Single Responsibility: Retrieve relevant jobs based on query and parameters.
 """
@@ -11,96 +24,74 @@ from app.db.connection import get_conn
 from app.services.search_service import hybrid_search
 from app.config import settings
 from app.pipeline.graph.state.graph_state import GraphState
-from app.pipeline.ingestion.embedder import get_embedder
 
 logger = logging.getLogger(__name__)
 
 
-def retriever(state: GraphState) -> dict[str, object]:
-    """
-    Retrieve relevant job chunks using hybrid search.
+async def retriever(state: GraphState) -> dict[str, object]:
+    """Retrieve relevant job chunks using hybrid search.
 
     Expects reasoning_output from reasoning_agent node containing:
     - retriever_query: The query to search for
-    - top_k: Number of results to retrieve
-    - filters: Metadata filters (job_level, job_category, job_location)
+    - top_k:          Number of results to retrieve
+    - filters:        Metadata filters (7 fields: job_level, job_category,
+                      job_location, company_name, job_title, date_order, date_after)
 
-    The node is intentionally pure search logic: it embeds the query,
-    performs hybrid retrieval, and returns only the state keys it modifies.
+    Returns only the state keys this node modifies.
     """
-    # Get retrieval parameters from reasoning_agent output
+    # ── Unpack reasoning_output ───────────────────────────────────────────────
     reasoning_output = state.get("reasoning_output")
     if reasoning_output:
-        query = reasoning_output.retriever_query
-        top_k = reasoning_output.top_k
+        query   = reasoning_output.retriever_query
+        top_k   = reasoning_output.top_k
         filters = reasoning_output.filters or {}
     else:
-        # Fallback for compatibility
-        query = state.get("resolved_query") or state.get("user_query") or state.get("query", "")
-        top_k = state.get("top_k", 5)
+        # Fallback for direct invocation / tests
+        query   = state.get("resolved_query") or state.get("user_query") or state.get("query", "")
+        top_k   = state.get("top_k", 5)
         filters = state.get("filters", {})
 
     retry_count = state.get("retry_count", 0)
-    top_k = max(1, min(int(top_k), 50))  # Clamp to 1-50
+    top_k = max(1, min(int(top_k), 50))  # clamp to 1-50
 
     if not query:
         logger.warning("Retriever: No query provided")
-        return {
-            "retrieved_chunks": [],
-            "retry_count": retry_count,
-        }
+        return {"retrieved_chunks": [], "retry_count": retry_count}
 
     logger.info(
-        f"Retrieving chunks: query_len={len(query)}, top_k={top_k}, "
-        f"filters={filters}, retry_count={retry_count}"
+        "Retriever: query_len=%d, top_k=%d, filters=%s, retry=%d",
+        len(query), top_k, filters, retry_count,
     )
 
     try:
-        # Embed the query
-        embedder = get_embedder()
-        query_embedding = embedder.embed_batch([query])[0]
-
-        if not query_embedding:
-            logger.error("Embedder returned empty query embedding")
-            return {
-                "retrieved_chunks": [],
-                "retry_count": retry_count,
-            }
-
-        logger.debug(f"Query embedding dimension: {len(query_embedding)}")
-
-        # Perform hybrid search
         with get_conn() as conn:
-            retrieved_chunks = hybrid_search(
+            retrieved_chunks = await hybrid_search(
                 conn=conn,
                 query_text=query,
-                query_embedding=query_embedding,
                 filters=filters,
-                top_k_vector=max(settings.TOP_K_VECTOR, top_k * 4),
-                top_k_keyword=max(settings.TOP_K_KEYWORD, top_k * 4),
+                top_k_vector=max(settings.LLAMA_CLOUD_TOP_K, top_k * 4),
                 final_top_k=top_k,
             )
 
-            # Fallback: retry without filters if no results found
+            # ── Graceful fallback: retry without filters if nothing returned ──
             if not retrieved_chunks and filters:
-                logger.info(f"No chunks found with filters={filters}; retrying without filters")
-                retrieved_chunks = hybrid_search(
+                logger.info(
+                    "No chunks with filters=%s; retrying without filters", filters
+                )
+                retrieved_chunks = await hybrid_search(
                     conn=conn,
                     query_text=query,
-                    query_embedding=query_embedding,
                     filters={},
-                    top_k_vector=max(settings.TOP_K_VECTOR, top_k * 4),
-                    top_k_keyword=max(settings.TOP_K_KEYWORD, top_k * 4),
+                    top_k_vector=max(settings.LLAMA_CLOUD_TOP_K, top_k * 4),
                     final_top_k=top_k,
                 )
 
-        logger.info(f"Retrieved {len(retrieved_chunks)} chunks")
-
+        logger.info("Retriever: returned %d chunks", len(retrieved_chunks))
         return {
             "retrieved_chunks": retrieved_chunks,
             "retry_count": retry_count,
         }
 
     except Exception as exc:
-        logger.exception(f"Error in retriever: {exc}")
+        logger.exception("Error in retriever: %s", exc)
         raise

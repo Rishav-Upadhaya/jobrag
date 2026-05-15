@@ -26,13 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         initialize_pool()
         initialize_schema()
-        # Pre-warm embedding model on startup
-        logger.info("Pre-warming embedding model...")
-        from app.pipeline.ingestion.embedder import get_embedder
-        embedder = get_embedder()
-        # Run one dummy embed to fully initialize the model
-        embedder.embed_batch(["warmup"])
-        logger.info("Embedding model ready")
+        logger.info("Database pool and schema ready (LlamaCloud handles embeddings)")
     except Exception:
         logger.exception("Database pool warmup failed during startup")
     yield

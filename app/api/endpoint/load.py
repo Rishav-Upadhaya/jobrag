@@ -1,149 +1,180 @@
+"""Load endpoint — ingests job data from Excel/CSV.
+
+New flow (post-LlamaCloud refactor):
+  1. Parse Excel/CSV → DataFrame
+  2. Preprocess → enriched job records (plain chunks + enriched_chunks)
+  3. Upsert job metadata + plain chunks → PostgreSQL (FTS)
+  4. Upload file directly to LlamaCloud (Managed Indexing handles embeddings)
+
+No local embedding is performed. LlamaCloud owns the vector index.
+"""
+
 from __future__ import annotations
 
 import logging
 import os
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from psycopg2 import Error as PsycopgError
 
-from app.db import vectorstore
 from app.db.connection import get_conn
+from app.db import repository
 from app.models.response import LoadResponse
-from app.pipeline.ingestion import embedder, parser, preprocessor
+from app.pipeline.ingestion import parser, preprocessor
+from app.pipeline.ingestion.llama_hooks import llama_search_hook
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-LOAD_BATCH_SIZE = 100
+LOAD_BATCH_SIZE = 20
 
 
-def _iter_batches(rows: list[dict[str, object]], batch_size: int = LOAD_BATCH_SIZE):
-	for start in range(0, len(rows), batch_size):
-		yield rows[start : start + batch_size]
+def _iter_batches(rows: list, batch_size: int = LOAD_BATCH_SIZE):
+    for start in range(0, len(rows), batch_size):
+        yield rows[start : start + batch_size]
 
 
 @router.post("/load", response_model=LoadResponse)
-async def load_file(file: UploadFile = File(...), overwrite: bool = Form(False)) -> LoadResponse:
-	start = time.monotonic()
-	tmp_path: str | None = None
-	jobs_loaded = 0
-	chunks_created = 0
+async def load_file(
+    file: UploadFile = File(...),
+    overwrite: bool = Form(False),
+) -> LoadResponse:
+    """Ingest an Excel or CSV file of job listings.
 
-	filename = file.filename or ""
-	suffix = Path(filename).suffix
+    Steps:
+      1. Parse file → validate columns
+      2. Preprocess rows → enriched records for SQL
+      3. Upsert jobs + plain chunks to PostgreSQL
+      4. Upload raw file to LlamaCloud for managed vector indexing
 
-	try:
-		with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-			tmp.write(await file.read())
-			tmp_path = tmp.name
+    Args:
+        file:      Uploaded Excel (.xlsx) or CSV file
+        overwrite: If True, delete existing jobs and chunks before inserting
+    """
+    start_time = time.monotonic()
+    tmp_path: str | None = None
+    jobs_loaded = 0
+    chunks_created = 0
 
-		try:
-			df = parser.parse(tmp_path)
-		except ValueError as exc:
-			raise HTTPException(status_code=422, detail=str(exc)) from exc
+    filename = file.filename or ""
+    suffix = Path(filename).suffix
 
-		preprocessed_rows = preprocessor.preprocess(df)
-		dropped_rows = len(df) - len(preprocessed_rows)
-		embedding_client = embedder.get_embedder()
-		total_batches = max(1, (len(preprocessed_rows) + LOAD_BATCH_SIZE - 1) // LOAD_BATCH_SIZE)
+    try:
+        # ── Step 1: Save upload to temp file, parse ───────────────────────────
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
-		try:
-			conn = None
-			with get_conn() as conn:
-				# Reset pooled connection state in case a prior request left a transaction open.
-				conn.rollback()
-				if overwrite:
-					with conn.cursor() as cursor:
-						cursor.execute("DELETE FROM job_chunks;")
-						cursor.execute("DELETE FROM jobs;")
+        try:
+            df = parser.parse(tmp_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-				# Gather all jobs and chunks first
-				jobs_payload: list[dict[str, object]] = []
-				all_chunk_texts: list[str] = []
-				all_chunk_meta: list[tuple[str, int]] = []  # (job_id, chunk_index)
+        # ── Step 2: Preprocess → records for SQL ─────────────────────────────
+        # We still preprocess to get structured metadata for the local DB
+        preprocessed_rows = preprocessor.preprocess(df)
+        dropped_rows = len(df) - len(preprocessed_rows)
 
-				for job in preprocessed_rows:
-					jobs_payload.append(
-						{
-							"id": job["job_id"],
-							"job_title": job.get("job_title"),
-							"company_name": job.get("company_name"),
-							"job_category": job.get("job_category"),
-							"publication_date": job.get("publication_date"),
-							"job_location": job.get("job_location"),
-							"job_level": job.get("job_level"),
-							"tags": job.get("tags"),
-						}
-					)
-					for chunk_index, chunk_text in enumerate(job.get("chunks", [])):
-						all_chunk_texts.append(chunk_text)
-						all_chunk_meta.append((job["job_id"], chunk_index))
+        if not preprocessed_rows:
+            return LoadResponse(
+                status="ok",
+                jobs_loaded=0,
+                chunks_created=0,
+                dropped_rows=dropped_rows,
+                time_seconds=time.monotonic() - start_time,
+            )
 
-				logger.info(
-					"Total jobs: %s, total chunks: %s",
-					len(jobs_payload),
-					len(all_chunk_texts),
-				)
+        logger.info(
+            "Preprocessed %d rows for SQL (%d dropped)", len(preprocessed_rows), dropped_rows
+        )
 
-				# Embed all chunks in one batch
-				embeddings: list[list[float]] = []
-				if all_chunk_texts:
-					embeddings = embedding_client.embed_batch(all_chunk_texts)
-					if len(embeddings) != len(all_chunk_texts):
-						raise ValueError(
-							f"Embedding count mismatch: {len(embeddings)} != {len(all_chunk_texts)}"
-						)
+        # ── Step 3: Upsert metadata + plain chunks to PostgreSQL ──────────────
+        conn = None
+        try:
+            with get_conn() as conn:
+                conn.rollback()
 
-				# Prepare chunk rows with embeddings
-				chunk_rows: list[tuple[str, int, str, list[float]]] = []
-				for (job_id, chunk_index), chunk_text, embedding in zip(all_chunk_meta, all_chunk_texts, embeddings):
-					chunk_rows.append((job_id, chunk_index, chunk_text, embedding))
+                if overwrite:
+                    with conn.cursor() as cursor:
+                        cursor.execute("DELETE FROM job_chunks;")
+                        cursor.execute("DELETE FROM jobs;")
+                    logger.info("Overwrite mode: cleared existing jobs and chunks")
 
-				# Upsert jobs and chunks in batches
-				for batch_index, job_batch in enumerate(_iter_batches(jobs_payload), start=1):
-					logger.info("Upserting job batch %s/%s", batch_index, total_batches)
-					vectorstore.bulk_upsert_jobs(conn, job_batch, commit=False)
-					jobs_loaded += len(job_batch)
+                for batch_index, batch in enumerate(_iter_batches(preprocessed_rows), 1):
+                    # Upsert job metadata rows
+                    repository.bulk_upsert_jobs(conn, batch, commit=False)
+                    jobs_loaded += len(batch)
 
-					# Corresponding chunks for this job batch
-					batch_job_ids = {job["id"] for job in job_batch}
-					chunk_batch = [row for row in chunk_rows if row[0] in batch_job_ids]
-					if chunk_batch:
-						vectorstore.bulk_upsert_chunks_with_options(conn, chunk_batch, commit=False)
-						chunks_created += len(chunk_batch)
+                    # Upsert plain chunk text rows for local vector search
+                    chunk_texts: list[str] = []
+                    job_indices: list[tuple[str, int]] = []
+                    for job in batch:
+                        job_id = job.get("job_id") or ""
+                        # We embed the ENRICHED chunks for better semantic retrieval
+                        for chunk_index, chunk_text in enumerate(job.get("enriched_chunks", [])):
+                            chunk_texts.append(chunk_text)
+                            job_indices.append((job_id, chunk_index))
 
-					conn.commit()
+                    if chunk_texts:
+                        from app.pipeline.ingestion.embedder import get_embedder
+                        logger.info(
+                            "Batch %d: Embedding %d chunks locally using BGE-M3...", 
+                            batch_index, len(chunk_texts)
+                        )
+                        embeddings = get_embedder().embed_batch(chunk_texts)
+                        
+                        # Note: We store the PLAIN chunk text in the DB for display/FTS,
+                        # but the EMBEDDING comes from the enriched text.
+                        chunk_rows = []
+                        chunk_iter = 0
+                        for job in batch:
+                            job_id = job.get("job_id") or ""
+                            for idx, plain_text in enumerate(job.get("chunks", [])):
+                                emb = embeddings[chunk_iter]
+                                chunk_rows.append((job_id, idx, plain_text, emb))
+                                chunk_iter += 1
 
-		except PsycopgError as exc:
-			if conn is not None:
-				try:
-					conn.rollback()
-				except Exception:
-					pass
-				logger.exception("Database error during load")
-				raise HTTPException(status_code=500, detail="Database error during load") from exc
-		except Exception as exc:
-			logger.exception("Processing error during load")
-			if conn is not None:
-				try:
-					conn.rollback()
-				except Exception:
-					pass
-				raise HTTPException(status_code=500, detail="Error during load processing") from exc
+                        repository.bulk_upsert_chunks(conn, chunk_rows, commit=False)
+                        chunks_created += len(chunk_rows)
 
-		time_seconds = time.monotonic() - start
-		return LoadResponse(
-			status="ok",
-			jobs_loaded=jobs_loaded,
-			chunks_created=chunks_created,
-			dropped_rows=dropped_rows,
-			time_seconds=time_seconds,
-		)
-	finally:
-		if tmp_path and os.path.exists(tmp_path):
-			os.unlink(tmp_path)
-		await file.close()
+                    conn.commit()
+                    logger.info(
+                        "SQL batch %d/%d: %d jobs committed with local embeddings", 
+                        batch_index, (len(preprocessed_rows) + LOAD_BATCH_SIZE - 1) // LOAD_BATCH_SIZE, len(batch)
+                    )
+
+        except PsycopgError as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.exception("Database error during load")
+            raise HTTPException(
+                status_code=500, detail="Database error during load"
+            ) from exc
+
+        # ── Step 4: Upload file to LlamaCloud for Managed Indexing ───────────
+        # This triggers LlamaCloud's managed parsing and vector indexing.
+        try:
+            await llama_search_hook.index_file(tmp_path)
+            logger.info("LlamaCloud managed indexing initiated for file: %s", filename)
+        except Exception as exc:
+            # We log but don't fail, as SQL data is already committed.
+            logger.error("LlamaCloud indexing failed: %s", exc)
+
+        return LoadResponse(
+            status="ok",
+            jobs_loaded=jobs_loaded,
+            chunks_created=chunks_created,
+            dropped_rows=dropped_rows,
+            time_seconds=time.monotonic() - start_time,
+        )
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        await file.close()

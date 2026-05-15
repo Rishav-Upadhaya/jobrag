@@ -4,10 +4,17 @@ psycopg2-binary
 pgvector
 langgraph
 langchain
+langchain-core
 langchain-openai
 langchain-google-genai
 langchain-community
-sentence-transformers
+langchain-text-splitters
+
+# LlamaCloud — vector indexing, embedding, semantic search
+llama-cloud
+llama-index-core
+llama-index-indices-managed-llama-cloud
+
 pandas
 openpyxl
 beautifulsoup4

@@ -3,6 +3,12 @@
 Understands the user query with conversation context, extracts retrieval
 parameters (top_k, filters), and generates a standalone retriever query.
 
+Filters extracted (7 fields):
+  - job_level, job_category, job_location  (original 3)
+  - company_name, job_title               (new — SQL LIKE filters)
+  - date_order                             (new — "desc"/"asc" → ORDER BY)
+  - date_after                             (new — ISO date → WHERE pub_date >)
+
 Single Responsibility: Query understanding and parameter extraction.
 """
 
@@ -19,26 +25,47 @@ from app.pipeline.graph.prompts.reasoning_agent import REASONING_AGENT_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# All valid filter keys the LLM may return — anything else is stripped.
+_VALID_FILTER_KEYS = {
+    "job_level",
+    "job_category",
+    "job_location",
+    "company_name",
+    "job_title",
+    "date_order",
+    "date_after",
+}
+
+
+def _sanitize_filters(raw: Any) -> dict:
+    """Strip unknown keys and null/empty values from LLM filter output."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: v
+        for k, v in raw.items()
+        if k in _VALID_FILTER_KEYS and v and str(v).strip()
+    }
+
 
 def reasoning_agent(state: GraphState) -> dict[str, Any]:
-    """
-    Analyze user query and conversation context to extract retrieval parameters.
+    """Analyze user query and conversation context to extract retrieval parameters.
 
     Returns only the keys this node modifies.
-    
+
     Responsibilities:
     - Extract top_k from query (default 5, range 1-50)
-    - Extract filters (job_level, job_category, job_location)
+    - Extract filters: job_level, job_category, job_location,
+                       company_name, job_title, date_order, date_after
     - Generate standalone retriever_query
     - Provide reasoning explanation
-    
+
     Args:
         state: GraphState containing messages, query, and conversation context
-        
+
     Returns:
         dict with keys: reasoning_output, retry_count, resolved_query
     """
-
     messages = state.get("messages", [])
     user_query = extract_user_query(messages) if messages else state.get("query", "")
     retry_count = state.get("retry_count", 0)
@@ -55,11 +82,15 @@ def reasoning_agent(state: GraphState) -> dict[str, Any]:
             "retry_count": retry_count,
         }
 
-    logger.info(f"Reasoning agent: Analyzing query: {user_query[:60]}...")
+    logger.info("Reasoning agent: Analyzing query: %s...", user_query[:80])
 
     try:
         # Build conversation history for context (limit to 4 messages)
-        history = build_history(messages, limit=4) if messages else "No previous conversation."
+        history = (
+            build_history(messages, limit=4)
+            if messages
+            else "No previous conversation."
+        )
 
         # Format prompt with user query and history
         formatted_prompt = REASONING_AGENT_PROMPT.format(
@@ -67,29 +98,31 @@ def reasoning_agent(state: GraphState) -> dict[str, Any]:
             history=history,
         )
 
-        # Get reasoning from LLM
-        llm = get_llm("classifier", max_tokens=512)
+        # Use classifier-tier LLM (fast + cheap); 768 tokens is enough for 7 fields
+        llm = get_llm("classifier", max_tokens=768)
         response = llm.invoke([SystemMessage(content=formatted_prompt)])
         content = response.content if hasattr(response, "content") else str(response)
 
         # Parse structured response
         structured_response = parse_json_object(content)
-        logger.debug(f"Reasoning agent response: {structured_response}")
+        logger.debug("Reasoning agent response: %s", structured_response)
 
-        # Extract and validate fields
+        # ── top_k ─────────────────────────────────────────────────────────────
         top_k = structured_response.get("top_k", 5)
-        top_k = max(1, min(int(top_k), 50))  # Clamp to 1-50
+        top_k = max(1, min(int(top_k), 50))
 
-        filters = structured_response.get("filters", {})
-        if not isinstance(filters, dict):
-            filters = {}
-        # Clean up None/empty filters
-        filters = {k: v for k, v in filters.items() if v}
+        # ── filters ───────────────────────────────────────────────────────────
+        raw_filters = structured_response.get("filters", {})
+        filters = _sanitize_filters(raw_filters)
 
-        retriever_query = str(structured_response.get("retriever_query", user_query)).strip()
+        # ── retriever_query ───────────────────────────────────────────────────
+        retriever_query = str(
+            structured_response.get("retriever_query", user_query)
+        ).strip()
         if not retriever_query:
             retriever_query = user_query
 
+        # ── reasoning ─────────────────────────────────────────────────────────
         reasoning = str(structured_response.get("reasoning", "")).strip()
 
         # Build output
@@ -101,8 +134,10 @@ def reasoning_agent(state: GraphState) -> dict[str, Any]:
         )
 
         logger.info(
-            f"Reasoning agent complete: top_k={top_k}, "
-            f"filters={filters}, query_len={len(retriever_query)}"
+            "Reasoning agent complete: top_k=%d, filters=%s, query_len=%d",
+            top_k,
+            filters,
+            len(retriever_query),
         )
 
         return {
@@ -112,8 +147,7 @@ def reasoning_agent(state: GraphState) -> dict[str, Any]:
         }
 
     except Exception as exc:
-        logger.exception(f"Error in reasoning_agent: {exc}")
-        # Return safe defaults on error
+        logger.exception("Error in reasoning_agent: %s", exc)
         return {
             "reasoning_output": ReasoningOutput(
                 top_k=5,
