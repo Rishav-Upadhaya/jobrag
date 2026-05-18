@@ -1,7 +1,9 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HF_HOME="/app/.cache/huggingface" \
+    SENTENCE_TRANSFORMERS_HOME="/app/.cache/sentence_transformers"
 
 WORKDIR /app
 
@@ -22,19 +24,8 @@ COPY uv.lock ./
 # Install dependencies
 RUN uv sync --frozen
 
-# Suppress HF hub progress bars and ensure transformers can run during build
-ENV TRANSFORMERS_OFFLINE=0
-ENV HF_HUB_DISABLE_PROGRESS_BARS=1
-
-# Pre-download SentenceTransformer model into the image layer to avoid
-# runtime downloads on cold start.
-RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
-
-# Prevent the model from making HTTP calls to HuggingFace on every query
-# to check for updates — this cuts retriever time by 4-6 seconds alone
-ENV SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
-ENV HF_HOME=/app/.cache/huggingface
-ENV TRANSFORMERS_OFFLINE=1
+# Pre-download BGE-M3 model to bake into the image
+RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
 
 # Copy app source
 COPY . .

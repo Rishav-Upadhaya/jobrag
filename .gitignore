@@ -8,9 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
-.claude
 .ruff_cache
 .pytest_cache
 .env
 data/
 tests/
+
+docs/RAG_LangGraph_Report.md

@@ -1,175 +1,194 @@
-# Leapfrog Agent
+# Leapfrog Agent — RAG Job Search
 
-## Project overview
+This repository implements a Retrieval-Augmented Generation (RAG) pipeline for job search over the LF Jobs dataset. The README below documents the high-level architecture and engineering decisions, setup and installation steps, example usage, assumptions, and future work.
 
-Leapfrog Agent is a FastAPI-based retrieval-augmented generation system for job data. It lets users ask natural-language questions about roles, companies, and filters, then returns answers grounded in the LF Jobs dataset. The pipeline combines structured database filters, hybrid retrieval, and LLM synthesis so answers stay tied to actual listings.
+---
 
-## Architecture
+## 1. High-level architecture & engineering decisions
 
-The data model is intentionally split into two tables: `jobs` stores structured metadata for filtering, while `job_chunks` stores chunked job descriptions, embeddings, and keyword-search vectors. That separation keeps SQL filtering simple and lets semantic retrieval operate only on the chunk table.
+- **API layer — FastAPI (async)**: chosen for async request handling, Pydantic validation, and lightweight routing. FastAPI keeps endpoints fast and simple for concurrent query loads.
+- **Orchestration — LangGraph state graph**: nodes model intent → retrieve → synthesise → judge flows. This explicit state graph makes retry logic, conditional edges, and testing of individual nodes straightforward.
+- **Vector store — PostgreSQL + pgvector**: co-locates metadata and vectors; reliable, simple to run (docker-compose) and suitable for a dataset ~1k rows. HNSW indexes provide efficient cosine search without a separate vector DB service.
+- **Embeddings — pluggable provider abstraction**: `BaseEmbedder` allows switching providers (Gemini / Cohere / HF) while enforcing batch size and vector dimension constraints. Keeps vendor lock-in minimal.
+- **Retrieval — vector search (Jina reranker used for reranking)**: combines semantic matches and optional fusion steps. Keyword FTS is documented but currently not active in the codebase; vector search with metadata filters is the active path.
+- **Reranker — cross-encoder (CPU-friendly model)**: reorders fused candidates for precision. CPU-friendly models (e.g., MiniLM cross-encoder) balance cost and quality.
+- **Synthesis & judging — single LLM factory**: all LLM calls unify through `app/infrastructure/llm/gemini_client.py` to centralize provider configuration, rate limiting, and prompts per node (classifier, synthesizer, judge).
+- **Schema separation — `jobs` vs `job_chunks`**: structured filters live in `jobs`, text+embeddings live in `job_chunks`. This keeps metadata filtering efficient and retrieval focused.
+- **SQL via psycopg2 (no ORM)**: direct SQL gives predictable performance and explicit control over indexes and queries for hybrid search.
 
-Query execution follows a LangGraph flow: intent classification routes the request, valid queries go to hybrid retrieval, retrieval output is synthesized into an answer, and a judge node evaluates the result before the API response is finalized. The retry loop is controlled inside the graph, so the API layer only receives the completed state.
+Rationale: choices prioritize reproducibility, traceability (explicit graph state), and predictable costs (postgre+CPU models) while keeping the architecture simple to run locally and on Docker.
 
-## Setup and installation
+---
 
-1. Start PostgreSQL, the backend, and Adminer:
+## 2. Setup and installation
 
-   ```bash
-	docker compose up --build
-   ```
+Prerequisites:
+- Docker & Docker Compose
+- Python 3.11+
 
-2. Open Adminer at http://localhost:8080 and connect with:
-
-	- System: PostgreSQL
-	- Server: db
-	- Username: raguser
-	- Password: ragpass
-	- Database: ragdb
-
-3. Run the database migration:
-
-   ```bash
-	psql postgresql://raguser:ragpass@localhost:5432/ragdb -f app/db/migrations/001_init.sql
-   ```
-
-4. Install Python dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-5. Create your local environment file:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-6. Fill in `.env` with your embedding settings, LLM provider, and API keys. The backend container already points at the compose database service.
-
-## Running the API
-
-Start the server with either of these commands:
+Quick start (recommended):
 
 ```bash
+# 1. Start Postgres with pgvector
+docker compose up -d --build
+
+# 2. Set up environment and install dependencies (preferred: `uv` CLI)
+# Preferred: use `uv` to initialize and manage the virtual environment
+uv init
+uv venv .venv
+uv add -r requirements.txt
+
+# Alternative: using Python's built-in venv
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Run DB migrations
+psql $DATABASE_URL -f app/infrastructure/db/migrations/001_init.sql
+
+# 4. Copy env and fill keys
+cp .env.example .env
+# edit .env to set DATABASE_URL and API keys
+
+# 5. Start the API
 uvicorn app.main:app --reload --port 8000
 ```
 
-```bash
-make dev
-```
+Notes:
+- If you use Docker-only development, you may prefer running the API inside the project container defined in `docker-compose.yml`.
+- Ensure `EMBEDDING_DIMENSION` in `.env` matches the provider and DB VECTOR dimension (default 768).
 
-The health check is available at `GET /health`.
+---
 
-**Note:** Initial data load for 1000 jobs takes 5-10 minutes on CPU (Docker cannot access Apple Silicon MPS). The embedding model is pre-cached in the Docker image so queries are fast after first load.
+## 3. Example usage — requests & expected responses
 
-## Example requests
-
-### Load data
+1) Load dataset (ingestion)
 
 Request:
 
 ```bash
-curl -X POST http://localhost:8000/api/load \
-	-F "file=@data/lf_jobs.xlsx" \
-	-F "overwrite=true"
+curl -X POST http://localhost:8000/api/v1/load \
+  -F "file=@data/LF Jobs.xlsx" \
+  -F "overwrite=true"
 ```
 
-Expected response shape:
+Expected response (success):
 
 ```json
 {
-	"status": "ok",
-	"jobs_loaded": 123,
-	"chunks_created": 456,
-	"dropped_rows": 7,
-	"time_seconds": 12.34
+  "status": "ok",
+  "jobs_loaded": 1000,
+  "chunks_created": 3500,
+  "dropped_rows": 0,
+  "time_seconds": 12.3
 }
 ```
 
-### Query jobs
+2) Query the system
 
 Request:
 
 ```bash
-curl -X POST http://localhost:8000/api/query \
-	-H "Content-Type: application/json" \
-	-d '{
-		"query": "senior machine learning roles in New York",
-		"top_k": 5,
-		"filters": {
-			"job_level": "Senior",
-			"job_location": "New York"
-		}
-	}'
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"senior machine learning roles in New York", "top_k":5}'
 ```
 
-Expected response shape:
+Expected response (valid intent):
 
 ```json
 {
-	"query": "senior machine learning roles in New York",
-	"answer": "...",
-	"sources": [
-		{
-			"job_id": "LF0001",
-			"job_title": "Machine Learning Engineer",
-			"company_name": "Example Co",
-			"job_level": "Senior",
-			"job_location": "New York",
-			"relevance_score": 0.91,
-			"matched_chunk": "..."
-		}
-	],
-	"judge": {
-		"score": 0.88,
-		"verdict": "pass",
-		"reasoning": "...",
-		"relevance": 0.9,
-		"quality": 0.86,
-		"hallucination": false
-	},
-	"intent": "valid",
-	"latency_ms": 123.45,
-	"clarification_question": null,
-	"message": null,
-	"status": null
+  "query": "senior machine learning roles in New York",
+  "answer": "[Senior ML Engineer] at Acme · New York · Senior\n- Matches because...\n[Senior Data Scientist] at BetaCorp · NYC · Senior\n- Matches because...",
+  "sources": [
+    {"job_id":"LF001","job_title":"Senior ML Engineer","company_name":"Acme","job_level":"Senior","job_location":"New York","relevance_score":0.92},
+    {"job_id":"LF021","job_title":"Senior Data Scientist","company_name":"BetaCorp","job_level":"Senior","job_location":"New York","relevance_score":0.88}
+  ],
+  "judge": {"score":0.85,"verdict":"pass","reasoning":"Relevant and faithful to context","relevance":0.88,"quality":0.82,"hallucination":false},
+  "intent": "valid",
+  "latency_ms": 980
 }
 ```
 
-If the query is vague, the response includes a `clarification_question` instead of an answer. If it is off topic, the response includes a rejection message and status information.
+If the classifier marks the query `vague`, the API returns a 200 with `intent: "vague"` and `clarification_question` instead of `answer`.
 
-## LLM provider switching
+If the query is `off_topic`, the API returns an informative rejection message with `intent: "off_topic"`.
 
-Change `LLM_PROVIDER` in `.env` to switch providers:
+---
 
-```bash
-LLM_PROVIDER=gemini
-```
+## 4. Assumptions made during development
 
-Supported values are `openai`, `gemini`, and `openrouter`. Make sure the matching API key is set as well: `OPENAI_API_KEY` for OpenAI, `GOOGLE_API_KEY` for Gemini, or `OPENROUTER_API_KEY` plus `OPENROUTER_BASE_URL` for OpenRouter. The synthesizer, classifier, and judge can also use separate model names through their respective environment variables.
+- Small dataset (≈1k jobs): pgvector + CPU reranker is cost-effective and performant.
+- Embedding dimension 768 is standard for chosen models; code enforces this dimension when upserting vectors.
+- No authentication required for API (out of scope).
+- All LLM calls are routed via `app/infrastructure/llm/gemini_client.py` and configured via environment variables.
+- Reranker will run on CPU (no GPU dependency assumed).
 
-## Embedding provider switching
+---
 
-To avoid Gemini embeddings and use a free local Hugging Face model instead, set:
+## 5. Drawbacks and future enhancements
 
-```bash
-EMBEDDING_PROVIDER=huggingface
-EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
-EMBEDDING_DIMENSION=768
-```
+Drawbacks:
+- Single-node Postgres with pgvector may not scale beyond modest datasets; large-scale production should use a managed vector DB or sharded solution.
+- CPU-only reranking limits throughput and latency for high-concurrency workloads.
+- Current judge/synthesizer prompts are designed for fidelity but may still allow subtle hallucinations — automated evaluation depends on quality of retrieved chunks.
 
-This uses `sentence-transformers` locally, so there is no per-request embedding API cost once the model is downloaded.
+Future enhancements:
+- Add optional GPU-based reranking and batch LLM synthesis for latency-sensitive deployments.
+- Add authentication and rate-limiting for a public API.
+- Add monitoring (Prometheus / Grafana) and structured tracing for observability of LLM calls and DB latencies.
+- Improve ingestion to support incremental updates and resumable embedding jobs.
+- Add a lightweight UI for interactive browsing of retrieved jobs and sources.
 
-## Running tests
+---
 
-Run the test suite with:
+If you'd like, I can also:
 
-```bash
-pytest tests/ -v
-```
+- run the test suite, or
+- commit this change and create a Git branch.
 
-You can also use:
+---
 
-```bash
-make test
-```
+## Observability & Frontend — what the screenshots show and how to interpret them
+
+LangSmith traces (LangGraph waterfall)
+- What you see: a vertical waterfall of nodes (for example `intent_classifier`, `reasoning_agent`, `retriever`, `synthesizer`, `judge`) with per-node timing, provider tags (which LLM/model was called), and expandable inputs/outputs (prompts, retrieved chunks, responses).
+- Key signals visible in the trace:
+  - Node durations: how long each node ran (LLM nodes vs non-LLM nodes). Treat each LLM call as a baseline of ~1–2 seconds for budgeting and SLOs — traces showing >>30s are likely slow-provider outliers or debug runs and can be ignored for baseline planning.
+  - LLM prompt / response payloads: useful for spotting prompt drift, token inflation, or unwanted instructions that may cause hallucination.
+  - Retrieved results summary: number of chunks returned, ranks/scores from the hybrid search and reranker, and whether any filters removed matches.
+  - Judge outputs: per-dimension scores (relevance, quality) and `hallucination_flag` which indicate whether the synthesizer invented facts not present in context.
+  - Retry loops & routing: repeated passes from `judge` → `retriever` indicate the system retried due to a failed judge verdict.
+
+- Common issues you can spot and how to act:
+  - Long latency concentrated in a single LLM node: check provider choice, network, or batching; consider switching provider or enabling batching/caching.
+  - Many retries from judge with low judge_score: improve retriever quality (better embeddings, chunking, reranker) or relax judge thresholds for retries.
+  - Empty or irrelevant `retrieved_chunks`: check ingestion (indexing), filters applied, and chunking strategy; ensure vector indexes (HNSW) are healthy.
+  - Hallucination_flag=true: tighten the synthesizer prompt to require citations, increase context coverage, or surface provenance to the user.
+
+Frontend UI snapshot (chat + sources view)
+- What you see: a conversation UI with a history/left pane, the main chat area that shows the assistant's answer (job list entries formatted like `[Job] at [Company] · [Location] · [Level]` with short explanations), inline clarifying prompts (if the classifier asks for more detail), and a small judge badge (e.g., `PASS · 93%`) with a control to view matched sources/excerpts.
+
+- What to inspect in the UI and why it matters:
+  - Clarification prompts present: indicates the intent classifier found the query too vague — the system is correctly asking for user input before retrieving.
+  - Matches listed vs sources panel: verify that every listed job in the answer is backed by a source excerpt in the sources view; mismatches point to synthesis hallucination.
+  - Judge badge & score: low scores imply poor relevance or structure — use these as triggers for retriever tuning or prompt improvements.
+
+Recommended observability metrics & thresholds (starting guidance)
+- LLM latency per call: target mean ≈1.0–2.0s, p95 < 3s (treat anything consistently >5s as a problem).
+- Retriever precision@5: aim for >0.7 for good user-facing relevance.
+- Judge pass rate: target >0.75 (monitor drops after model changes).
+- Hallucination rate: target <2% of queries (automated checks using judge + provenance sampling).
+- Index staleness / ingestion lag: monitor time since last successful ingestion and number of failed chunk upserts.
+
+Operational recommendations when traces / UI show problems
+- If LLM nodes are slow: enable request batching, move to a faster provider, or cache repeated prompts/responses.
+- If judge fails often: add more high-quality retrieved context (increase top_k, improve chunking overlap), retrain the reranker with hard negatives, or tighten the synthesizer prompt to forbid invention.
+- If retriever returns poor results: re-evaluate embedding model (higher-quality embeddings such as OpenAI text-embedding models are a strong option), increase vector search recall, try alternative ANN backends, and add query reformulation before retrieval.
+- If frontend shows missing provenance: surface matched chunk excerpts and a `view source` link per result so users (and the judge) can verify claims.
+
+Notes on timing in traces
+- While traces may sometimes show long per-node durations, use the 1–2s per-LLM-call baseline for planning and SLOs unless you intentionally run slower providers. Long trace durations in screenshots should not be treated as the expected performance baseline.
+
+If you'd like, I can now replace the current placeholder guidance with these concrete descriptions in the README (done), and optionally add a short troubleshooting checklist that links specific trace observations to concrete fixes in the codebase.
+
