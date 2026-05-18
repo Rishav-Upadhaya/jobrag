@@ -37,7 +37,7 @@ services:
       - ./tests:/app/tests:cached
       - hf_cache:/app/.cache/huggingface
     # Rebuild on compose restart only; code changes hot-reload via --reload flag
-    command: uv run uvicorn app.api.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir=/app/app
+    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir=/app/app
 
   adminer:
     image: adminer:4

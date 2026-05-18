@@ -1,7 +1,7 @@
 import sys
 
-from app.api.endpoint import load as load_module
-from app.api.endpoint import query as query_module
+from app.api.v1.endpoints import load as load_module
+from app.api.v1.endpoints import query as query_module
 
 load = load_module
 query = query_module
