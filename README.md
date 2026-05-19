@@ -130,22 +130,15 @@ If the query is `off_topic`, the API returns an informative rejection message wi
 
 Drawbacks:
 - Single-node Postgres with pgvector may not scale beyond modest datasets; large-scale production should use a managed vector DB or sharded solution.
-- CPU-only reranking limits throughput and latency for high-concurrency workloads.
+- Free tier Jina reranking limits throughput and latency for high-concurrency workloads.
 - Current judge/synthesizer prompts are designed for fidelity but may still allow subtle hallucinations — automated evaluation depends on quality of retrieved chunks.
 
 Future enhancements:
-- Add optional GPU-based reranking and batch LLM synthesis for latency-sensitive deployments.
+- Add Premium Tiers reranking and batch LLM synthesis for latency-sensitive deployments.
 - Add authentication and rate-limiting for a public API.
 - Add monitoring (Prometheus / Grafana) and structured tracing for observability of LLM calls and DB latencies.
 - Improve ingestion to support incremental updates and resumable embedding jobs.
 - Add a lightweight UI for interactive browsing of retrieved jobs and sources.
-
----
-
-If you'd like, I can also:
-
-- run the test suite, or
-- commit this change and create a Git branch.
 
 ---
 
@@ -189,6 +182,4 @@ Operational recommendations when traces / UI show problems
 
 Notes on timing in traces
 - While traces may sometimes show long per-node durations, use the 1–2s per-LLM-call baseline for planning and SLOs unless you intentionally run slower providers. Long trace durations in screenshots should not be treated as the expected performance baseline.
-
-If you'd like, I can now replace the current placeholder guidance with these concrete descriptions in the README (done), and optionally add a short troubleshooting checklist that links specific trace observations to concrete fixes in the codebase.
 
