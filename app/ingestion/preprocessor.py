@@ -105,8 +105,6 @@ def preprocess(df: pd.DataFrame) -> list[dict[str, Any]]:
 			company_name=company_name,
 		)
 
-		# enriched_chunks = what LlamaCloud will embed
-		# Plain chunks    = stored in job_chunks.chunk_text for FTS
 		enriched_chunks = [
 			f"{prefix}\n\n{chunk}" if prefix else chunk
 			for chunk in chunks

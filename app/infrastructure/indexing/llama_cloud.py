@@ -24,10 +24,6 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-# ── Parsing Models ────────────────────────────────────────────────────────────
-
-
-
 # ── Search Models ─────────────────────────────────────────────────────────────
 
 class LlamaSearchResult(BaseModel):
