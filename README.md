@@ -1,4 +1,4 @@
-# Leapfrog Agent — RAG Job Search
+# RAG Job Search
 
 This repository implements a Retrieval-Augmented Generation (RAG) pipeline for job search over the LF Jobs dataset. The README below documents the high-level architecture and engineering decisions, setup and installation steps, example usage, assumptions, and future work.
 
