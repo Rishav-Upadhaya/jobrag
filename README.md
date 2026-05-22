@@ -134,11 +134,12 @@ Drawbacks:
 - Current judge/synthesizer prompts are designed for fidelity but may still allow subtle hallucinations — automated evaluation depends on quality of retrieved chunks.
 
 Future enhancements:
-- Add Premium Tiers reranking and batch LLM synthesis for latency-sensitive deployments.
+- Add Premium Tiers reranking, embedding and batch LLM synthesis for latency-sensitive deployments.
 - Add authentication and rate-limiting for a public API.
+- Add Semantic Caching on Redis, when user gradually increases.
+- Add GraphRag to find the connections between the companies and roles and provide the proper context to llm.
 - Add monitoring (Prometheus / Grafana) and structured tracing for observability of LLM calls and DB latencies.
 - Improve ingestion to support incremental updates and resumable embedding jobs.
-- Add a lightweight UI for interactive browsing of retrieved jobs and sources.
 
 ---
 
