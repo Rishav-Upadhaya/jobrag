@@ -1,6 +1,6 @@
 import logging
 
-from langchain.messages import SystemMessage
+from langchain.messages import HumanMessage
 from app.infrastructure.llm.gemini_client import get_llm
 from app.orchestration.langgraph.state.graph_state import GraphState
 from app.orchestration.langgraph.utils.context import build_context_block_from_chunks
@@ -46,7 +46,7 @@ def synthesizer(state: GraphState) -> dict[str, object]:
         )
 
         llm = get_llm("synthesizer")
-        response = llm.invoke([SystemMessage(content=formatted_prompt)])
+        response = llm.invoke([HumanMessage(content=formatted_prompt)])
         answer = response.content.strip() if hasattr(response, "content") else str(response).strip()
 
         logger.info("Answer synthesized successfully")

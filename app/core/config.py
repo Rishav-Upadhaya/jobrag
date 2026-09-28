@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     LLAMA_CLOUD_TOP_K: int = 40
 
     # ── LLM providers ────────────────────────────────────────────────────────
-    LLM_PROVIDER: str                          # "google" | "openai" | "openrouter"
+    LLM_PROVIDER: str                          # "gemini" | "openai" | "openrouter"
     LLM_SYNTHESIZER_MODEL: str
     LLM_CLASSIFIER_MODEL: str
     LLM_JUDGE_MODEL: str
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     JINA_RERANK_THRESHOLD: float = 0.3        # Lowered from 0.5 to avoid empty results
 
     # ── Retrieval knobs ───────────────────────────────────────────────────────
-    # Keyword search (pgvector FTS — still used alongside LlamaCloud vector)
+    # Keyword search (Postgres full-text), fused with vector hits via RRF
     TOP_K_KEYWORD: int = 40
     TOP_K_RERANK: int = 10                    # Final candidates after Jina rerank
     RRF_K: int = 60                           # RRF smoothing constant

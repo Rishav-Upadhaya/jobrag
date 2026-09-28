@@ -31,11 +31,16 @@ def get_llm(
 			temperature=settings.LLM_TEMPERATURE,
 		)
 	if provider == "gemini":
+		# Gemini 2.5 Flash "thinks" by default and the hidden reasoning counts
+		# against max_output_tokens, which truncates the small JSON answers the
+		# classifier and judge ask for. Pro models cannot disable thinking.
+		thinking = {"thinking_budget": 0} if "flash" in model else {}
 		return ChatGoogleGenerativeAI(
 			model=model,
 			google_api_key=settings.GOOGLE_API_KEY,
 			max_output_tokens=max_tokens,
 			temperature=settings.LLM_TEMPERATURE,
+			**thinking,
 		)
 	if provider == "openrouter":
 		return ChatOpenAI(

@@ -1,7 +1,7 @@
 [project]
-name = "leapfrog-agent"
+name = "jobrag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hybrid-retrieval RAG for job search: LangGraph, pgvector + Postgres full-text, RRF, LLM judge."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -30,3 +30,12 @@ dependencies = [
     "sentence-transformers>=3.3.1",
     "uvicorn[standard]>=0.46.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

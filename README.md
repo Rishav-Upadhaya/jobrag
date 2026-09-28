@@ -1,186 +1,108 @@
-# RAG Job Search
+# JobRAG
 
-This repository implements a Retrieval-Augmented Generation (RAG) pipeline for job search over the LF Jobs dataset. The README below documents the high-level architecture and engineering decisions, setup and installation steps, example usage, assumptions, and future work.
+[![CI](https://github.com/Rishav-Upadhaya/jobrag/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishav-Upadhaya/jobrag/actions/workflows/ci.yml)
 
----
+Natural-language job search over 1,000 job postings (the LF Jobs dataset). A LangGraph pipeline classifies the question, extracts metadata filters, runs hybrid retrieval (dense vectors + Postgres full-text, fused with Reciprocal Rank Fusion), reranks, writes a grounded answer, and has an LLM judge check that answer against the retrieved context.
 
-## 1. High-level architecture & engineering decisions
-
-- **API layer — FastAPI (async)**: chosen for async request handling, Pydantic validation, and lightweight routing. FastAPI keeps endpoints fast and simple for concurrent query loads.
-- **Orchestration — LangGraph state graph**: nodes model intent → retrieve → synthesise → judge flows. This explicit state graph makes retry logic, conditional edges, and testing of individual nodes straightforward.
-- **Vector store — PostgreSQL + pgvector**: co-locates metadata and vectors; reliable, simple to run (docker-compose) and suitable for a dataset ~1k rows. HNSW indexes provide efficient cosine search without a separate vector DB service.
-- **Embeddings — pluggable provider abstraction**: `BaseEmbedder` allows switching providers (Gemini / Cohere / HF) while enforcing batch size and vector dimension constraints. Keeps vendor lock-in minimal.
-- **Retrieval — vector search (Jina reranker used for reranking)**: combines semantic matches and optional fusion steps. Keyword FTS is documented but currently not active in the codebase; vector search with metadata filters is the active path.
-- **Reranker — cross-encoder (CPU-friendly model)**: reorders fused candidates for precision. CPU-friendly models (e.g., MiniLM cross-encoder) balance cost and quality.
-- **Synthesis & judging — single LLM factory**: all LLM calls unify through `app/infrastructure/llm/gemini_client.py` to centralize provider configuration, rate limiting, and prompts per node (classifier, synthesizer, judge).
-- **Schema separation — `jobs` vs `job_chunks`**: structured filters live in `jobs`, text+embeddings live in `job_chunks`. This keeps metadata filtering efficient and retrieval focused.
-- **SQL via psycopg2 (no ORM)**: direct SQL gives predictable performance and explicit control over indexes and queries for hybrid search.
-
-Rationale: choices prioritize reproducibility, traceability (explicit graph state), and predictable costs (postgre+CPU models) while keeping the architecture simple to run locally and on Docker.
-
----
-
-## 2. Setup and installation
-
-Prerequisites:
-- Docker & Docker Compose
-- Python 3.11+
-
-Quick start (recommended):
-
-```bash
-# 1. Start Postgres with pgvector
-docker compose up -d --build
-
-# 2. Set up environment and install dependencies (preferred: `uv` CLI)
-# Preferred: use `uv` to initialize and manage the virtual environment
-uv init
-uv venv .venv
-uv add -r requirements.txt
-
-# Alternative: using Python's built-in venv
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Run DB migrations
-psql $DATABASE_URL -f app/infrastructure/db/migrations/001_init.sql
-
-# 4. Copy env and fill keys
-cp .env.example .env
-# edit .env to set DATABASE_URL and API keys
-
-# 5. Start the API
-uvicorn app.main:app --reload --port 8000
+```
+query ─▶ intent_classifier ─▶ reasoning_agent ─▶ retriever ─▶ synthesizer ─▶ judge ─▶ response
+             │ off_topic / vague        │ filters      │                         │ fail
+             ▼                          ▼              │                         └─▶ retry retriever
+       polite rejection /        job_level, location,  │
+       clarifying question       company, title, date  ▼
+                                   SQL metadata pre-filter (jobs table)
+                                     ├─ vector search:  BGE-M3 (1024-d) + pgvector HNSW, top 40
+                                     └─ keyword search: tsvector + GIN, title/metadata weighted over body, top 40
+                                   ─▶ RRF fusion (k=60) ─▶ max 2 chunks per job ─▶ Jina reranker ─▶ top 5
 ```
 
-Notes:
-- If you use Docker-only development, you may prefer running the API inside the project container defined in `docker-compose.yml`.
-- Ensure `EMBEDDING_DIMENSION` in `.env` matches the provider and DB VECTOR dimension (default 768).
+## Design decisions
 
----
+- **Postgres for everything.** Job metadata, chunk text, 1024-d vectors (HNSW) and full-text vectors (GIN) live in one database. At ~1k jobs / 12k chunks this removes a separate vector service and lets metadata filters and both retrievers share one `job_id` whitelist.
+- **Hybrid retrieval with RRF.** Dense search finds paraphrases ("ML" ≈ "machine learning"); full-text search catches exact titles, companies and locations that embeddings blur. Their scores are on unrelated scales (cosine vs `ts_rank_cd`), so they are merged by rank with Reciprocal Rank Fusion rather than by score.
+- **Keyword terms are OR-ed.** `plainto_tsquery` ANDs every word, so "senior ML roles in New York" would require "roles". The query ORs terms and lets `ts_rank_cd` rank jobs matching more of them higher. Job titles carry weight A, other metadata B, description text C.
+- **Explicit graph, not an agent loop.** Each LangGraph node has one job and returns only the state it changes, so routing (off-topic, vague, retry-on-judge-fail) is visible in code and in traces.
+- **Local embeddings.** BGE-M3 runs on CPU via `sentence-transformers`; no embedding API cost or rate limit at ingestion time.
+- **Plain SQL (psycopg2).** Retrieval queries are hand-written so index usage is explicit.
 
-## 3. Example usage — requests & expected responses
+## Run it
 
-1) Load dataset (ingestion)
-
-Request:
+Prerequisites: Docker, Python 3.11+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/load \
-  -F "file=@data/LF Jobs.xlsx" \
-  -F "overwrite=true"
+cp .env.example .env            # set LLM_PROVIDER + model names + API keys, JINA_API_KEY
+docker compose up -d db         # Postgres 16 + pgvector
+uv sync
+uv run uvicorn app.main:app --port 8000
 ```
 
-Expected response (success):
+The schema in `app/infrastructure/db/migrations/001_init.sql` is applied at startup and is idempotent, so existing databases pick up new columns and indexes on the next boot. `docker compose up -d` also starts the API, Adminer (`:8080`) and a small chat frontend (`:3000`).
+
+`LLM_PROVIDER` is `gemini`, `openai` or `openrouter`. Use a pinned, non-reasoning model for the classifier and judge: they return short JSON under tight token caps, and reasoning models (including many behind `openrouter/free`) can spend the whole budget thinking and return nothing.
+
+## Example
+
+Load the dataset. `data/` is git-ignored: the LF Jobs spreadsheet is not redistributed here, and any `.xlsx`/`.csv` with the same columns works. Timing below is BGE-M3 on an Apple M-series CPU, where embedding dominates:
+
+```bash
+curl -X POST http://localhost:8000/api/load -F "file=@data/LF Jobs.xlsx" -F "overwrite=true"
+```
 
 ```json
-{
-  "status": "ok",
-  "jobs_loaded": 1000,
-  "chunks_created": 3500,
-  "dropped_rows": 0,
-  "time_seconds": 12.3
-}
+{"status": "ok", "jobs_loaded": 1000, "chunks_created": 12096, "dropped_rows": 0, "time_seconds": 623.8}
 ```
 
-2) Query the system
-
-Request:
+Query:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/query \
+curl -X POST http://localhost:8000/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query":"senior machine learning roles in New York", "top_k":5}'
+  -d '{"query": "remote python backend jobs"}'
 ```
 
-Expected response (valid intent):
+Real response (Gemini 2.5 Flash for all LLM nodes; answer and chunk excerpts shortened):
 
 ```json
 {
-  "query": "senior machine learning roles in New York",
-  "answer": "[Senior ML Engineer] at Acme · New York · Senior\n- Matches because...\n[Senior Data Scientist] at BetaCorp · NYC · Senior\n- Matches because...",
-  "sources": [
-    {"job_id":"LF001","job_title":"Senior ML Engineer","company_name":"Acme","job_level":"Senior","job_location":"New York","relevance_score":0.92},
-    {"job_id":"LF021","job_title":"Senior Data Scientist","company_name":"BetaCorp","job_level":"Senior","job_location":"New York","relevance_score":0.88}
-  ],
-  "judge": {"score":0.85,"verdict":"pass","reasoning":"Relevant and faithful to context","relevance":0.88,"quality":0.82,"hallucination":false},
+  "query": "remote python backend jobs",
   "intent": "valid",
-  "latency_ms": 980
+  "answer": "Here are a few remote backend and Python-related roles that might be a good fit for you!\n\n**Principal Backend Software Engineer** at **Atlassian**\n· Location: Canada, Flexible / Remote, San Francisco, CA | Level: Senior Level\n…",
+  "sources": [
+    {"job_id": "LF0192", "job_title": "Senior Python Data Engineer", "company_name": "EPAM Systems", "job_location": "Nurota, Uzbekistan", "relevance_score": 0.61},
+    {"job_id": "LF0233", "job_title": "Principal Backend Software Engineer", "company_name": "Atlassian", "job_location": "Canada, Flexible / Remote, San Francisco, CA", "relevance_score": 0.565},
+    {"job_id": "LF0036", "job_title": "AI Researcher, 2025 Graduate U.S.", "company_name": "Atlassian", "job_location": "Flexible / Remote, San Francisco, CA", "relevance_score": 0.491},
+    {"job_id": "LF0478", "job_title": "Staff Product Designer, Crypto", "company_name": "Robinhood", "job_location": "Bellevue, WA, Menlo Park, CA, New York, NY, Toronto, Canada", "relevance_score": 0.401}
+  ],
+  "judge": {"score": 0.9, "verdict": "pass", "relevance": 0.9, "quality": 0.9, "hallucination": false,
+            "reasoning": "The answer accurately summarizes relevant remote Python and backend jobs from the context without any hallucinations."},
+  "latency_ms": 19623
 }
 ```
 
-If the classifier marks the query `vague`, the API returns a 200 with `intent: "vague"` and `clarification_question` instead of `answer`.
+Other outcomes from the same run:
 
-If the query is `off_topic`, the API returns an informative rejection message with `intent: "off_topic"`.
+| Query | Result | Latency |
+|---|---|---|
+| `senior machine learning roles in New York` | filters `{job_level: Senior, job_title: Machine Learning Engineer, job_location: New York}` → Coinbase Staff ML Engineer; judge 1.0 | 8.4 s |
+| `what is the weather today` | `intent: off_topic`, rejection message, no retrieval | 1.4 s |
 
----
+`relevance_score` is the Jina rerank score when the reranker returned the chunk, otherwise the RRF score (≈0.016–0.033).
 
-## 4. Assumptions made during development
+## Tests
 
-- Small dataset (≈1k jobs): pgvector + CPU reranker is cost-effective and performant.
-- Embedding dimension 768 is standard for chosen models; code enforces this dimension when upserting vectors.
-- No authentication required for API (out of scope).
-- All LLM calls are routed via `app/infrastructure/llm/gemini_client.py` and configured via environment variables.
-- Reranker will run on CPU (no GPU dependency assumed).
+```bash
+uv run pytest                                   # unit tests, no services needed
+docker run -d --rm -p 5433:5432 -e POSTGRES_PASSWORD=test pgvector/pgvector:pg16
+TEST_DATABASE_URL=postgresql://postgres:test@localhost:5433/postgres uv run pytest   # + real-Postgres tests
+```
 
----
+- `tests/test_hybrid_search.py`: RRF ordering and de-duplication, per-job chunk cap, reranker success and failure fallback, keyword-only hits surviving fusion, metadata whitelist passed to both retrievers, keyword rank never leaking into `relevance_score`.
+- `tests/test_keyword_search_db.py`: runs the real migration against pgvector and checks title-over-body ranking, OR semantics, metadata search, whitelist, stop-word-only queries, and migration idempotency.
 
-## 5. Drawbacks and future enhancements
+## Known limitations
 
-Drawbacks:
-- Single-node Postgres with pgvector may not scale beyond modest datasets; large-scale production should use a managed vector DB or sharded solution.
-- Free tier Jina reranking limits throughput and latency for high-concurrency workloads.
-- Current judge/synthesizer prompts are designed for fidelity but may still allow subtle hallucinations — automated evaluation depends on quality of retrieved chunks.
-
-Future enhancements:
-- Add Premium Tiers reranking, embedding and batch LLM synthesis for latency-sensitive deployments.
-- Add authentication and rate-limiting for a public API.
-- Add Semantic Caching on Redis, when user gradually increases.
-- Add GraphRag to find the connections between the companies and roles and provide the proper context to llm.
-- Add monitoring (Prometheus / Grafana) and structured tracing for observability of LLM calls and DB latencies.
-- Improve ingestion to support incremental updates and resumable embedding jobs.
-
----
-
-## Observability & Frontend — what the screenshots show and how to interpret them
-
-LangSmith traces (LangGraph waterfall)
-- What you see: a vertical waterfall of nodes (for example `intent_classifier`, `reasoning_agent`, `retriever`, `synthesizer`, `judge`) with per-node timing, provider tags (which LLM/model was called), and expandable inputs/outputs (prompts, retrieved chunks, responses).
-- Key signals visible in the trace:
-  - Node durations: how long each node ran (LLM nodes vs non-LLM nodes). Treat each LLM call as a baseline of ~1–2 seconds for budgeting and SLOs — traces showing >>30s are likely slow-provider outliers or debug runs and can be ignored for baseline planning.
-  - LLM prompt / response payloads: useful for spotting prompt drift, token inflation, or unwanted instructions that may cause hallucination.
-  - Retrieved results summary: number of chunks returned, ranks/scores from the hybrid search and reranker, and whether any filters removed matches.
-  - Judge outputs: per-dimension scores (relevance, quality) and `hallucination_flag` which indicate whether the synthesizer invented facts not present in context.
-  - Retry loops & routing: repeated passes from `judge` → `retriever` indicate the system retried due to a failed judge verdict.
-
-- Common issues you can spot and how to act:
-  - Long latency concentrated in a single LLM node: check provider choice, network, or batching; consider switching provider or enabling batching/caching.
-  - Many retries from judge with low judge_score: improve retriever quality (better embeddings, chunking, reranker) or relax judge thresholds for retries.
-  - Empty or irrelevant `retrieved_chunks`: check ingestion (indexing), filters applied, and chunking strategy; ensure vector indexes (HNSW) are healthy.
-  - Hallucination_flag=true: tighten the synthesizer prompt to require citations, increase context coverage, or surface provenance to the user.
-
-Frontend UI snapshot (chat + sources view)
-- What you see: a conversation UI with a history/left pane, the main chat area that shows the assistant's answer (job list entries formatted like `[Job] at [Company] · [Location] · [Level]` with short explanations), inline clarifying prompts (if the classifier asks for more detail), and a small judge badge (e.g., `PASS · 93%`) with a control to view matched sources/excerpts.
-
-- What to inspect in the UI and why it matters:
-  - Clarification prompts present: indicates the intent classifier found the query too vague — the system is correctly asking for user input before retrieving.
-  - Matches listed vs sources panel: verify that every listed job in the answer is backed by a source excerpt in the sources view; mismatches point to synthesis hallucination.
-  - Judge badge & score: low scores imply poor relevance or structure — use these as triggers for retriever tuning or prompt improvements.
-
-Recommended observability metrics & thresholds (starting guidance)
-- LLM latency per call: target mean ≈1.0–2.0s, p95 < 3s (treat anything consistently >5s as a problem).
-- Retriever precision@5: aim for >0.7 for good user-facing relevance.
-- Judge pass rate: target >0.75 (monitor drops after model changes).
-- Hallucination rate: target <2% of queries (automated checks using judge + provenance sampling).
-- Index staleness / ingestion lag: monitor time since last successful ingestion and number of failed chunk upserts.
-
-Operational recommendations when traces / UI show problems
-- If LLM nodes are slow: enable request batching, move to a faster provider, or cache repeated prompts/responses.
-- If judge fails often: add more high-quality retrieved context (increase top_k, improve chunking overlap), retrain the reranker with hard negatives, or tighten the synthesizer prompt to forbid invention.
-- If retriever returns poor results: re-evaluate embedding model (higher-quality embeddings such as OpenAI text-embedding models are a strong option), increase vector search recall, try alternative ANN backends, and add query reformulation before retrieval.
-- If frontend shows missing provenance: surface matched chunk excerpts and a `view source` link per result so users (and the judge) can verify claims.
-
-Notes on timing in traces
-- While traces may sometimes show long per-node durations, use the 1–2s per-LLM-call baseline for planning and SLOs unless you intentionally run slower providers. Long trace durations in screenshots should not be treated as the expected performance baseline.
-
+- **Latency is LLM-bound:** 8–20 s per query with four sequential LLM calls (classifier, reasoning, synthesis, judge) on free-tier Gemini, and far longer under 429 rate limiting (a single-word query took 220 s during testing). Merging the classifier and reasoning steps into one call is the obvious first cut.
+- **Nodes fail open.** If the classifier, reasoning agent or judge errors or returns unparseable output, the pipeline continues with defaults (`intent=valid`, no filters, `verdict=pass`). That keeps answers flowing but means a broken judge looks like a passing one; the response says "Judge unavailable" when this happens.
+- **Low-relevance backfill.** When fewer than five chunks clear the rerank threshold, the remainder is backfilled from fused order, which is how a product-design role appears in the Python example above.
+- **No evaluation set yet.** Retrieval quality is checked by hand; recall@k and nDCG on a labelled query set are the next step.
+- Single-node Postgres, no auth or rate limiting on the API.

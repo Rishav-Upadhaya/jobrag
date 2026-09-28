@@ -28,6 +28,25 @@ def deduplicate_by_job(
     return result
 
 
+def reciprocal_rank_fusion(
+    result_lists: list[list[dict]],
+    k: int = 60,
+) -> list[dict]:
+    """Merge ranked lists by summing 1 / (k + rank) per chunk.
+
+    RRF needs no score calibration between retrievers, which matters here:
+    cosine similarity and ts_rank_cd live on unrelated scales.
+    """
+    fused: dict[object, dict] = {}
+    for results in result_lists:
+        for rank, chunk in enumerate(results, start=1):
+            key = chunk.get("chunk_id")
+            if key not in fused:
+                fused[key] = {**chunk, "fused_score": 0.0}
+            fused[key]["fused_score"] += 1.0 / (k + rank)
+    return sorted(fused.values(), key=lambda c: c["fused_score"], reverse=True)
+
+
 def rerank_chunks(
     chunks: list[dict],
     query: str,
@@ -93,13 +112,26 @@ async def hybrid_search(
         query_emb = get_embedder().embed_query(query_text)
         
         vector_results = repository.vector_search(
-            conn, 
+            conn,
             query_embedding=query_emb,
             job_id_whitelist=job_id_whitelist,
-            top_k=top_k_vector
+            top_k=top_k_vector,
+        )
+        keyword_results = repository.keyword_search(
+            conn,
+            query_text=query_text,
+            job_id_whitelist=job_id_whitelist,
+            top_k=settings.TOP_K_KEYWORD,
+        )
+        logger.info(
+            "hybrid_search: %d vector hits, %d keyword hits",
+            len(vector_results), len(keyword_results),
         )
 
-        results = deduplicate_by_job(vector_results, max_chunks_per_job=2)
+        fused = reciprocal_rank_fusion(
+            [vector_results, keyword_results], k=settings.RRF_K
+        )
+        results = deduplicate_by_job(fused, max_chunks_per_job=2)
 
         candidate_count = min(
             len(results),

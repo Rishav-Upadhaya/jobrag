@@ -1,7 +1,7 @@
 import logging
 from typing import Any
 
-from langchain.messages import SystemMessage
+from langchain.messages import HumanMessage
 from app.infrastructure.llm.gemini_client import get_llm
 from app.orchestration.langgraph.state.graph_state import GraphState
 from app.orchestration.langgraph.schemas.reasoning import ReasoningOutput
@@ -62,7 +62,7 @@ def reasoning_agent(state: GraphState) -> dict[str, Any]:
         )
 
         llm = get_llm("classifier", max_tokens=768)
-        response = llm.invoke([SystemMessage(content=formatted_prompt)])
+        response = llm.invoke([HumanMessage(content=formatted_prompt)])
         content = response.content if hasattr(response, "content") else str(response)
 
         structured_response = parse_json_object(content)

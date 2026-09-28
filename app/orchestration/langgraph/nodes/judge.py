@@ -1,7 +1,7 @@
 import logging
 import time
 
-from langchain.messages import SystemMessage
+from langchain.messages import HumanMessage
 from app.core.config import settings
 from app.orchestration.langgraph.state.graph_state import GraphState
 from app.orchestration.langgraph.utils.context import build_context_block_from_chunks
@@ -66,7 +66,7 @@ def judge(state: GraphState) -> dict[str, object]:
         content = None
         for attempt in range(1, max_retries + 1):
             try:
-                response = llm.invoke([SystemMessage(content=formatted_prompt)])
+                response = llm.invoke([HumanMessage(content=formatted_prompt)])
                 content = response.content if hasattr(response, "content") else str(response)
                 break
             except Exception as e:

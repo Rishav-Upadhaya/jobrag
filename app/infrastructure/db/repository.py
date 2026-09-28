@@ -197,3 +197,63 @@ def vector_search(
         raise
     finally:
         cursor.close()
+
+
+def keyword_search(
+    conn: psycopg2.extensions.connection,
+    query_text: str,
+    job_id_whitelist: list[str] | None = None,
+    top_k: int = 40,
+) -> list[dict]:
+    """Full-text search over job metadata and chunk text.
+
+    Terms are OR-ed rather than AND-ed: a natural-language query like
+    "senior ML roles in New York" should match jobs containing *some* of the
+    terms, with ts_rank_cd ordering the ones that contain more of them first.
+    """
+    if job_id_whitelist is not None and not job_id_whitelist:
+        return []
+
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        whitelist_clause = ""
+        params: list[Any] = [query_text]
+        if job_id_whitelist is not None:
+            whitelist_clause = "AND jc.job_id = ANY(%s)"
+            params.append(job_id_whitelist)
+        params.append(top_k)
+
+        query = f"""
+        WITH q AS (
+            SELECT NULLIF(
+                replace(plainto_tsquery('english', %s)::text, '&', '|'), ''
+            )::tsquery AS tsq
+        )
+        SELECT
+            jc.id            AS chunk_id,
+            jc.job_id,
+            jc.chunk_text,
+            ts_rank_cd(j.search_tsv || jc.search_tsv, q.tsq) AS keyword_score,
+            j.job_title,
+            j.company_name,
+            j.job_level,
+            j.job_location,
+            j.job_category,
+            j.publication_date,
+            j.tags
+        FROM job_chunks jc
+        JOIN jobs j ON jc.job_id = j.id
+        CROSS JOIN q
+        WHERE q.tsq IS NOT NULL
+          AND (j.search_tsv @@ q.tsq OR jc.search_tsv @@ q.tsq)
+          {whitelist_clause}
+        ORDER BY keyword_score DESC, jc.id
+        LIMIT %s
+        """
+        cursor.execute(query, params)
+        return [dict(r) for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error("Error in keyword_search: %s", e)
+        raise
+    finally:
+        cursor.close()

@@ -1,6 +1,6 @@
 import logging
 
-from langchain.messages import HumanMessage, SystemMessage
+from langchain.messages import HumanMessage
 
 from app.infrastructure.llm.gemini_client import get_llm
 from app.orchestration.langgraph.state.graph_state import GraphState
@@ -39,7 +39,7 @@ def intent_classifier(state: GraphState) -> dict:
         )
 
         llm = get_llm("classifier", max_tokens=256)
-        response = llm.invoke([SystemMessage(content=formatted_prompt)])
+        response = llm.invoke([HumanMessage(content=formatted_prompt)])
         content = response.content if hasattr(response, "content") else str(response)
         structured_response = parse_json_object(content)
 

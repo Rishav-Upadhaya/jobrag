@@ -12,7 +12,6 @@ wheels/
 .pytest_cache
 .env
 data/
-tests/
 
 docs/RAG_LangGraph_Report.md
 docs/ARCHITECTURE.md

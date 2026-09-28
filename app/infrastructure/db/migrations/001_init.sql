@@ -5,7 +5,8 @@
 --   • jobs        → structured metadata only (location, level, category, etc.)
 --   • job_chunks  → chunk text + BGE-M3 embeddings (vector(1024))
 --
--- Hybrid search uses SQL pre-filtering on metadata → local vector search.
+-- Hybrid search: SQL metadata pre-filter → dense vector search + Postgres
+-- full-text search, fused with Reciprocal Rank Fusion, then reranked.
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -51,7 +52,21 @@ CREATE INDEX IF NOT EXISTS jobs_pub_date_idx        ON jobs (publication_date DE
 CREATE INDEX IF NOT EXISTS job_chunks_embedding_hnsw_idx ON job_chunks USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS job_chunks_job_id_idx    ON job_chunks (job_id);
 
--- FTS index for job metadata (title, company) — still useful for direct keyword matches
--- Removed FTS GIN index: system currently relies on vector search and simple
--- metadata filters (LIKE) for matching. Historical docs referenced a
--- tsvector/GIN index; remove creation to avoid creating unused DB objects.
+-- ── Keyword search (Postgres full-text) ─────────────────────────────────────
+-- Job metadata is weighted above description text so a title match ("data
+-- engineer") outranks a passing mention in a description. Generated columns
+-- keep the vectors in sync on every upsert; ADD COLUMN IF NOT EXISTS lets
+-- existing databases pick this up on the next startup.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(job_title, '')), 'A') ||
+    setweight(to_tsvector('english',
+        coalesce(company_name, '') || ' ' || coalesce(job_category, '') || ' ' ||
+        coalesce(job_level, '')    || ' ' || coalesce(job_location, '')), 'B')
+) STORED;
+
+ALTER TABLE job_chunks ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', chunk_text), 'C')
+) STORED;
+
+CREATE INDEX IF NOT EXISTS jobs_search_tsv_idx       ON jobs       USING gin (search_tsv);
+CREATE INDEX IF NOT EXISTS job_chunks_search_tsv_idx ON job_chunks USING gin (search_tsv);
